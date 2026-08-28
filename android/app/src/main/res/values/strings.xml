@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">MusicFreeTV</string>
+    <string name="expo_splash_screen_status_bar_translucent">true</string>
+    <!-- rtnp channel id -->
+    <string name="rntp_temporary_channel_id">musicfreetv_temporary_channel</string>
+    <!-- rtnp channel name -->
+    <string name="rntp_temporary_channel_name">MusicFreeTV 播放</string>
+    <string name="playback_channel_name">MusicFreeTV 播放</string>
+</resources>

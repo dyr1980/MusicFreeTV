@@ -1,0 +1,17 @@
+MusicFreeTV
+Copyright (C) 2026 MusicFreeTV contributors
+
+This project is a modified version of MusicFree:
+https://github.com/maotoumao/MusicFree
+
+Original project author: 猫头猫 (maotoumao)
+Original project license: GNU Affero General Public License, version 3.
+Upstream baseline used for this derivative: d118b18b3d0c904400f7eea7bf99c0ceec6c1aee
+
+MusicFreeTV preserves the original copyright and license notices and is
+distributed under the GNU Affero General Public License, version 3. Source
+code for this modified version must remain available under that license when
+the program is conveyed or made available as a network service.
+
+MusicFreeTV is an independent derivative project and is not an official TV
+release from the original MusicFree author.
