@@ -2,6 +2,8 @@
 
 面向 Android TV、电视盒子和遥控器重新设计的插件化音乐播放器。
 
+项目主页：[https://github.com/Lostonelzq/MusicFreeTV](https://github.com/Lostonelzq/MusicFreeTV)
+
 MusicFreeTV 是 [maotoumao/MusicFree](https://github.com/maotoumao/MusicFree) 的独立派生项目，保留了原 Android 版的插件、搜索、推荐歌单、榜单、收藏、本地音乐、歌词、下载、历史记录、备份和播放控制能力，并为 10-foot UI 与 D-pad 操作重做了界面。本项目不是原作者发布的官方 TV 版本。
 
 ## TV 特性

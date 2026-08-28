@@ -130,6 +130,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "ssh://nice@192.168.31.110/home/nice/Repository/MusicFreeTV/musicfreetv.git"
+    "url": "https://github.com/Lostonelzq/MusicFreeTV.git"
   }
 }

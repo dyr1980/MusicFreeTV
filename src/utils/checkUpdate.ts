@@ -3,7 +3,7 @@ import { compare } from "compare-versions";
 import DeviceInfo from "react-native-device-info";
 
 const updateList = [
-    "https://music.spacetimeorigin.cn:9443/MusicFreeTV/version.json",
+    "https://raw.githubusercontent.com/Lostonelzq/MusicFreeTV/master/release/version.json",
 ];
 
 interface IUpdateInfo {

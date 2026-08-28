@@ -1,5 +1,7 @@
 # MusicFreeTV
 
+Repository: [https://github.com/Lostonelzq/MusicFreeTV](https://github.com/Lostonelzq/MusicFreeTV)
+
 MusicFreeTV is an independent Android TV derivative of [maotoumao/MusicFree](https://github.com/maotoumao/MusicFree), redesigned for 16:9 screens and D-pad remotes. It retains the Android app's plugin, search, recommendation, chart, playlist, local-library, lyrics, download, history, backup, and playback capabilities. It is not an official release by the upstream author.
 
 The app ships with no music source. Third-party plugins are executable CommonJS modules and may access the network; only install trusted plugins and use them lawfully. MusicFreeTV does not provide or bypass paid sources.
