@@ -1,25 +1,25 @@
-import AppBar from "@/components/base/appBar";
-import Icon from "@/components/base/icon.tsx";
-import IconButton from "@/components/base/iconButton";
-import Input from "@/components/base/input";
-import Button from "@/components/base/textButton.tsx";
-import { iconSizeConst } from "@/constants/uiConst";
-import { useI18N } from "@/core/i18n";
-import useColors from "@/hooks/useColors";
-import rpx from "@/utils/rpx";
-import Color from "color";
-import { useAtom, useSetAtom } from "jotai";
-import React from "react";
-import { StyleSheet, View } from "react-native";
-import { addHistory } from "../common/historySearch";
-import useSearch from "../hooks/useSearch";
+import AppBar from '@/components/base/appBar';
+import Icon from '@/components/base/icon.tsx';
+import IconButton from '@/components/base/iconButton';
+import Input from '@/components/base/input';
+import Button from '@/components/base/textButton.tsx';
+import {iconSizeConst} from '@/constants/uiConst';
+import {useI18N} from '@/core/i18n';
+import useColors from '@/hooks/useColors';
+import rpx from '@/utils/rpx';
+import Color from 'color';
+import {useAtom, useSetAtom} from 'jotai';
+import React from 'react';
+import {StyleSheet, View} from 'react-native';
+import {addHistory} from '../common/historySearch';
+import useSearch from '../hooks/useSearch';
 import {
     PageStatus,
     initSearchResults,
     pageStatusAtom,
     queryAtom,
     searchResultsAtom,
-} from "../store/atoms";
+} from '../store/atoms';
 
 export default function NavBar() {
     const search = useSearch();
@@ -27,10 +27,10 @@ export default function NavBar() {
     const setPageStatus = useSetAtom(pageStatusAtom);
     const colors = useColors();
     const setSearchResultsState = useSetAtom(searchResultsAtom);
-    const { t } = useI18N();
+    const {t} = useI18N();
 
     const onSearchSubmit = async () => {
-        if (query === "") {
+        if (query === '') {
             return;
         }
         setSearchResultsState(initSearchResults);
@@ -45,7 +45,11 @@ export default function NavBar() {
 
     return (
         <AppBar containerStyle={style.appbar} contentStyle={style.appbar}>
-            <View style={style.searchBarContainer}>
+            <View
+                style={[
+                    style.searchBarContainer,
+                    {backgroundColor: colors.pageBackground},
+                ]}>
                 <Icon
                     name="magnifying-glass"
                     color={hintTextColor}
@@ -58,20 +62,19 @@ export default function NavBar() {
                         style.searchBar,
                         {
                             color: colors.text,
-                            backgroundColor: colors.pageBackground,
                         },
                     ]}
                     accessible
-                    accessibilityLabel={t("searchPage.searchLabel.a11y")}
-                    accessibilityHint={t("searchPage.searchPlaceHolder")}
+                    accessibilityLabel={t('searchPage.searchLabel.a11y')}
+                    accessibilityHint={t('searchPage.searchPlaceHolder')}
                     onFocus={() => {
                         setPageStatus(PageStatus.EDITING);
                     }}
                     placeholderTextColor={hintTextColor}
-                    placeholder={t("searchPage.searchPlaceHolder")}
+                    placeholder={t('searchPage.searchPlaceHolder')}
                     onSubmitEditing={onSearchSubmit}
                     onChangeText={_ => {
-                        if (_ === "") {
+                        if (_ === '') {
                             setPageStatus(PageStatus.EDITING);
                         }
                         setQuery(_);
@@ -82,8 +85,9 @@ export default function NavBar() {
                     <IconButton
                         style={style.close}
                         sizeType="light"
+                        accessibilityLabel={t('common.clear')}
                         onPress={() => {
-                            setQuery("");
+                            setQuery('');
                             setPageStatus(PageStatus.EDITING);
                         }}
                         color={hintTextColor}
@@ -92,11 +96,15 @@ export default function NavBar() {
                 ) : null}
             </View>
             <Button
-                style={[style.button]}
+                style={style.button}
+                contentStyle={[
+                    style.buttonContent,
+                    {backgroundColor: colors.primary},
+                ]}
                 hitSlop={0}
-                fontColor={"appBarText"}
+                fontColor={'appBarText'}
                 onPress={onSearchSubmit}>
-                {t("common.search")}
+                {t('common.search')}
             </Button>
         </AppBar>
     );
@@ -107,33 +115,39 @@ const style = StyleSheet.create({
         paddingRight: 0,
     },
     button: {
-        paddingHorizontal: rpx(24),
-        height: "100%",
-        justifyContent: "center",
-        flexDirection: "row",
-        alignItems: "center",
+        width: rpx(144),
+        height: rpx(64),
+        marginLeft: rpx(24),
+        marginRight: rpx(24),
+    },
+    buttonContent: {
+        borderRadius: rpx(32),
     },
     searchBarContainer: {
         flex: 1,
-        flexDirection: "row",
-        alignItems: "center",
-    },
-    searchBar: {
         minWidth: rpx(375),
-        flex: 1,
-        paddingHorizontal: rpx(64),
-        borderRadius: rpx(64),
         height: rpx(64),
         maxHeight: rpx(64),
-        alignItems: "center",
+        flexDirection: 'row',
+        alignItems: 'center',
+        borderRadius: rpx(64),
+        overflow: 'hidden',
+    },
+    searchBar: {
+        flex: 1,
+        minWidth: 0,
+        height: '100%',
+        paddingLeft: rpx(64),
+        paddingRight: rpx(16),
+        alignItems: 'center',
     },
     magnify: {
-        position: "absolute",
+        position: 'absolute',
         left: rpx(16),
         zIndex: 100,
     },
     close: {
-        position: "absolute",
-        right: rpx(16),
+        flexShrink: 0,
+        marginRight: rpx(8),
     },
 });

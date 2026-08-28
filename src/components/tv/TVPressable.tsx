@@ -1,5 +1,5 @@
-import { TVColors, TVMetrics } from "@/constants/tvTheme";
-import React, { ReactNode, useRef, useState } from "react";
+import {TVColors, TVMetrics} from '@/constants/tvTheme';
+import React, {ReactNode, useRef, useState} from 'react';
 import {
     Animated,
     Pressable,
@@ -7,11 +7,12 @@ import {
     StyleProp,
     StyleSheet,
     ViewStyle,
-} from "react-native";
+} from 'react-native';
 
-interface ITVPressableProps extends Omit<PressableProps, "style" | "children"> {
+interface ITVPressableProps extends Omit<PressableProps, 'style' | 'children'> {
     children: ReactNode;
     style?: StyleProp<ViewStyle>;
+    contentStyle?: StyleProp<ViewStyle>;
     focusedStyle?: StyleProp<ViewStyle>;
     hasTVPreferredFocus?: boolean;
 }
@@ -20,6 +21,7 @@ interface ITVPressableProps extends Omit<PressableProps, "style" | "children"> {
 export default function TVPressable({
     children,
     style,
+    contentStyle,
     focusedStyle,
     onFocus,
     onBlur,
@@ -39,7 +41,7 @@ export default function TVPressable({
     };
 
     return (
-        <Animated.View style={[style, { transform: [{ scale }] }]}>
+        <Animated.View style={[style, {transform: [{scale}]}]}>
             <Pressable
                 {...props}
                 disabled={disabled}
@@ -59,6 +61,7 @@ export default function TVPressable({
                 }}
                 style={[
                     styles.target,
+                    contentStyle,
                     focused && styles.focused,
                     focused && focusedStyle,
                     disabled && styles.disabled,
@@ -71,14 +74,14 @@ export default function TVPressable({
 
 const styles = StyleSheet.create({
     target: {
-        width: "100%",
-        height: "100%",
-        alignItems: "center",
-        justifyContent: "center",
+        width: '100%',
+        height: '100%',
+        alignItems: 'center',
+        justifyContent: 'center',
         borderRadius: TVMetrics.radius,
         borderWidth: TVMetrics.focusWidth,
-        borderColor: "transparent",
-        overflow: "hidden",
+        borderColor: 'transparent',
+        overflow: 'hidden',
     },
     focused: {
         borderColor: TVColors.focus,

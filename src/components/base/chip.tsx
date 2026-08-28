@@ -1,10 +1,10 @@
-import React, { ReactNode } from "react";
-import { StyleProp, StyleSheet, View, ViewStyle } from "react-native";
-import rpx from "@/utils/rpx";
-import ThemeText from "./themeText";
-import useColors from "@/hooks/useColors";
-import IconButton from "./iconButton";
-import TVPressable from "@/components/tv/TVPressable";
+import React, {ReactNode} from 'react';
+import {StyleProp, StyleSheet, View, ViewStyle} from 'react-native';
+import rpx from '@/utils/rpx';
+import ThemeText from './themeText';
+import useColors from '@/hooks/useColors';
+import IconButton from './iconButton';
+import TVPressable from '@/components/tv/TVPressable';
 
 interface IChipProps {
     containerStyle?: StyleProp<ViewStyle>;
@@ -13,13 +13,14 @@ interface IChipProps {
     onClose?: () => void;
 }
 export default function Chip(props: IChipProps) {
-    const { containerStyle, children, onPress, onClose } = props;
+    const {containerStyle, children, onPress, onClose} = props;
     const colors = useColors();
 
     return (
         <TVPressable
             accessibilityRole="button"
             onPress={onPress}
+            contentStyle={styles.pressable}
             style={[
                 styles.container,
                 {
@@ -28,14 +29,22 @@ export default function Chip(props: IChipProps) {
                 containerStyle,
             ]}>
             <View style={styles.content}>
-                {typeof children === "string" ? (
-                    <ThemeText fontSize="subTitle" numberOfLines={1}>
+                {typeof children === 'string' ? (
+                    <ThemeText
+                        fontSize="subTitle"
+                        numberOfLines={1}
+                        style={styles.label}>
                         {children}
                     </ThemeText>
                 ) : (
                     children
                 )}
-                <IconButton onPress={onClose} name="x-mark" sizeType="small" style={styles.icon} />
+                <IconButton
+                    onPress={onClose}
+                    name="x-mark"
+                    sizeType="small"
+                    style={styles.icon}
+                />
             </View>
         </TVPressable>
     );
@@ -43,19 +52,31 @@ export default function Chip(props: IChipProps) {
 
 const styles = StyleSheet.create({
     container: {
+        width: rpx(208),
         height: rpx(56),
-        paddingHorizontal: rpx(18),
         borderRadius: rpx(28),
-        flexDirection: "row",
-        alignItems: "center",
-        justifyContent: "center",
     },
     content: {
-        flexDirection: "row",
-        alignItems: "center",
-        justifyContent: "center",
+        position: 'relative',
+        width: '100%',
+        height: '100%',
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+    pressable: {
+        width: 'auto',
+        height: '100%',
+    },
+    label: {
+        width: '100%',
+        paddingHorizontal: rpx(56),
+        textAlign: 'center',
     },
     icon: {
-        marginLeft: rpx(8),
+        position: 'absolute',
+        right: 0,
+        top: 0,
+        width: rpx(56),
+        height: '100%',
     },
 });
