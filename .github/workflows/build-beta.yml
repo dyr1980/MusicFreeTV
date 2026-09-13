@@ -1,51 +1,13 @@
-name: Beta 构建
+name: build APK
 
 on:
-  push:
-    branches: [dev]
-    paths: ['package.json']
   workflow_dispatch:
-    inputs:
-      force_build:
-        description: '强制构建 Beta 版本'
-        required: false
-        default: 'false'
-        type: boolean
+
+permissions:
+  contents: write
 
 jobs:
-  check-version:
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    outputs:
-      should_build: ${{ steps.version_check.outputs.should_build }}
-      version: ${{ steps.version_check.outputs.version }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Check version format
-        id: version_check
-        run: |
-          VERSION=$(node -p "require('./package.json').version")
-          echo "Current version: $VERSION"
-          
-          # 检查版本是否符合 -beta.xx 格式
-          if [[ $VERSION =~ -beta\.[0-9]{1,2}$ ]]; then
-            echo "✅ Version matches beta format: $VERSION"
-            echo "should_build=true" >> $GITHUB_OUTPUT
-            echo "version=$VERSION" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.force_build }}" == "true" ]]; then
-            echo "🔧 Force build triggered by workflow_dispatch"
-            echo "should_build=true" >> $GITHUB_OUTPUT
-            echo "version=$VERSION" >> $GITHUB_OUTPUT
-          else
-            echo "❌ Version does not match beta format or not forced: $VERSION"
-            echo "should_build=false" >> $GITHUB_OUTPUT
-          fi
-
-  build-beta:
-    needs: check-version
-    if: needs.check-version.outputs.should_build == 'true'
+  build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -60,7 +22,7 @@ jobs:
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
-        with: 
+        with:
           node-version: 20
           cache: 'npm'
 
@@ -77,25 +39,51 @@ jobs:
             ${{ runner.os }}-rn-
 
       - name: Install Dependencies
-        run: npm ci --prefer-offline --no-audit      
-        
-      - name: Setup Keystore (if secrets available)
-        if: ${{ secrets.RELEASE_KEYSTORE_BASE64 != '' }}
+        run: npm ci --prefer-offline --no-audit
+
+      - name: Replace Gradle Repositories with Aliyun Mirrors
+        run: |
+          cp android/build.gradle android/build.gradle.bak
+          cp android/settings.gradle android/settings.gradle.bak
+
+          python3 - << 'PYEOF'
+          def replace_repos(text):
+              text = text.replace("google()", "maven { url 'https://maven.aliyun.com/repository/google' }")
+              text = text.replace("mavenCentral()", "maven { url 'https://maven.aliyun.com/repository/public' }")
+              text = text.replace("gradlePluginPortal()", "maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }")
+              return text
+
+          for path in ["android/build.gradle", "android/settings.gradle"]:
+              with open(path, "r", encoding="utf-8") as f:
+                  content = f.read()
+              content = replace_repos(content)
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(content)
+              print(f"✅ 已替换 {path} 的仓库地址")
+          PYEOF
+
+          echo "=== android/settings.gradle ==="
+          cat android/settings.gradle
+          echo ""
+          echo "=== android/build.gradle ==="
+          cat android/build.gradle
+
+      - name: Setup Keystore
         run: |
           echo "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" | base64 -d > android/app/release.keystore
           cat > android/keystore.properties << 'EOF'
           RELEASE_STORE_FILE=release.keystore
           RELEASE_STORE_PASSWORD=${{ secrets.RELEASE_STORE_PASSWORD }}
           RELEASE_KEY_ALIAS=${{ secrets.RELEASE_KEY_ALIAS }}
-          RELEASE_KEY_PASSWORD=${{ secrets.RELEASE_KEY_PASSWORD }}
+          RELEASE_KEY_PASSWORD=${{ secrets.RELEASE_STORE_PASSWORD }}
           EOF
           chmod 600 android/keystore.properties android/app/release.keystore
 
       - name: Make gradlew executable
         run: chmod +x android/gradlew
 
-      - name: Build Beta APK
-        run: | 
+      - name: Build Release APK
+        run: |
           cd android
           ./gradlew assembleRelease --parallel --build-cache --configure-on-demand
 
@@ -104,16 +92,64 @@ jobs:
           echo "📱 Generated APK files:"
           find android/app/build/outputs/apk/release -name "*.apk" -exec ls -lh {} \;
 
-      - name: Upload Beta APKs
-        uses: actions/upload-artifact@v4
+      - name: Restore original Gradle files
+        if: always()
+        run: |
+          mv android/build.gradle.bak android/build.gradle
+          mv android/settings.gradle.bak android/settings.gradle
+
+      - name: Rename APKs and Generate SHA256SUMS
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          APK_DIR="android/app/build/outputs/apk/release"
+          OUT_DIR="release-output"
+          mkdir -p "$OUT_DIR"
+
+          echo "📦 版本号: $VERSION"
+
+          # 重命名规则：app-{abi}-release.apk → MusicFreeTV-{version}-{abi}.apk
+          rename_map=(
+            "app-arm64-v8a-release.apk:MusicFreeTV-${VERSION}-arm64-v8a.apk"
+            "app-armeabi-v7a-release.apk:MusicFreeTV-${VERSION}-armeabi-v7a.apk"
+            "app-universal-release.apk:MusicFreeTV-${VERSION}-universal.apk"
+            "app-x86-release.apk:MusicFreeTV-${VERSION}-x86.apk"
+            "app-x86_64-release.apk:MusicFreeTV-${VERSION}-x86_64.apk"
+          )
+
+          for entry in "${rename_map[@]}"; do
+            src="${entry%%:*}"
+            dst="${entry##*:}"
+            if [ -f "$APK_DIR/$src" ]; then
+              cp "$APK_DIR/$src" "$OUT_DIR/$dst"
+              echo "✅ $src → $dst"
+            else
+              echo "⚠️ 未找到 $src，跳过"
+            fi
+          done
+
+          # 生成 SHA256SUMS.txt
+          cd "$OUT_DIR"
+          sha256sum *.apk > SHA256SUMS.txt
+          echo ""
+          echo "=== SHA256SUMS.txt ==="
+          cat SHA256SUMS.txt
+          echo ""
+          echo "=== 输出目录内容 ==="
+          ls -lh
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: MusicFreeTV-${{ needs.check-version.outputs.version }}
-          path: android/app/build/outputs/apk/release/*.apk
-          retention-days: 30
+          tag_name: v${{ github.run_number }}
+          name: Release v${{ github.run_number }}
+          draft: false
+          prerelease: false
+          files: release-output/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build Summary
         run: |
-          echo "🎉 Beta build completed successfully!"
-          echo "📦 Version: ${{ needs.check-version.outputs.version }}"
-          echo "🚀 Triggered by: ${{ github.event_name }}"
-          echo "👤 Actor: ${{ github.actor }}"
+          echo "🎉 正式版构建成功"
+          echo "📦 Version: $(node -p "require('./package.json').version")"
+          echo "🔗 Release: https://github.com/${{ github.repository }}/releases/tag/v${{ github.run_number }}"
