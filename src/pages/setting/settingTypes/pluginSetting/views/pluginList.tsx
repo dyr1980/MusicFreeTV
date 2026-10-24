@@ -22,6 +22,12 @@ import { IIconName } from "@/components/base/icon.tsx";
 import { IInstallPluginResult } from "@/types/core/pluginManager";
 import { useI18N } from "@/core/i18n";
 
+// 【新增】后台线程预检：插件代码先在独立 JS 线程试运行，死循环在后台被
+// 超时捕获，主线程/UI 完全不卡。库未安装时自动降级为原看门狗行为。
+const Multithreading: any = (() => {
+    try { return require("react-native-multithreading"); } catch { return null; }
+})();
+
 interface IOption {
     icon: IIconName;
     title: string;
@@ -29,12 +35,13 @@ interface IOption {
 }
 
 // ============================================================
-// 最终定稿：可中断原生下载 + 自动重试 + 安装看门狗 + 全局熔断
-//           + 安装前登记 + 自动拉黑（防冻死插件循环卡住）
+// 最终定稿：可中断原生下载 + 自动重试 + 后台线程预检 + 安装看门狗
+//           + 全局熔断 + 安装前登记 + 自动拉黑
 // ============================================================
 
 const DOWNLOAD_TIMEOUT = 12000;
 const INSTALL_TIMEOUT = 10000;
+const PRECHECK_TIMEOUT = 15000; // 预检超时：超过即判定为死循环插件
 const MAX_RETRY = 3;
 // 【极其重要】针对重度混淆代码，必须降为 1！否则并发解析会导致低配设备直接闪退
 const BATCH_SIZE = 1;
@@ -111,7 +118,63 @@ function syncBlacklistFromLastInstall(): string | null {
 function isRetryableError(msg: string): boolean {
     const m = (msg || "").toLowerCase();
     if (m.includes("404") || m.includes("403") || m.includes("无效")) return false;
+    if (m.includes("死循环") || m.includes("预检")) return false;
     return true;
+}
+
+// ------------------------------------------------------------
+// 后台线程预检
+// 原理：把插件源码放进与 mountPlugin 相同的包装函数里，在独立 JS
+// Runtime 中同步执行。若插件有死循环，主线程的定时器照常触发，
+// Promise.race 超时返回"危险"，主线程 UI 全程流畅。
+// 注意：预检报错 ≠ 危险（真实安装有 try/catch 会优雅处理错误），
+// 只有"卡住超时"才判定为死循环。
+// ------------------------------------------------------------
+async function precheckPluginCode(code: string): Promise<{ safe: boolean; message?: string }> {
+    if (!Multithreading || typeof Multithreading.evalAsync !== "function") {
+        // 库不可用时降级：直接放行，靠原有看门狗兜底
+        return { safe: true, message: "precheck-unavailable" };
+    }
+    try {
+        // 与 plugin.ts mountPlugin 相同的包装结构；require 提供为抛错桩，
+        // 因为顶层 require 报错无害（真实安装会提供完整 require）
+        const script = `(
+            function() {
+                var module = { exports: {} };
+                var stubRequire = function(name) { throw new Error("PRECHECK_STUB"); };
+                var env = {
+                    userVariables: {},
+                    appVersion: "1.0.0",
+                    os: "android",
+                    lang: "zh-CN",
+                    getUserVariables: function() { return {}; },
+                };
+                var _process = { platform: "android", version: "1.0.0", env: env };
+                (function(require, __musicfree_require, module, exports, console, env, URL, process) {
+                    ${code}
+                })(stubRequire, stubRequire, module, module.exports, console, env, URL, _process);
+                return "OK";
+            }
+)()`;
+        let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+        const timeoutPromise = new Promise<never>((_, reject) => {
+            timeoutTimer = setTimeout(() => reject(new Error("预检超时")), PRECHECK_TIMEOUT);
+        });
+        try {
+            await Promise.race([Multithreading.evalAsync(script), timeoutPromise]);
+            // 正常返回或抛错都算"安全"（不会冻死主线程）
+            return { safe: true };
+        } finally {
+            if (timeoutTimer) clearTimeout(timeoutTimer);
+        }
+    } catch (e: any) {
+        if (e?.message === "预检超时") {
+            return { safe: false, message: "插件代码疑似死循环（后台预检超时）" };
+        }
+        // evalAsync 本身出错：按安全处理，走正常安装
+        trace("预检异常，走正常安装", e?.message);
+        return { safe: true };
+    }
 }
 
 async function downloadPluginFile(url: string): Promise<{ url: string; uri?: string; message?: string }> {
@@ -216,7 +279,7 @@ async function installOnePluginByUrl(
         }
     } catch { /* ignore */ }
 
-    // ★ 黑名单内的插件直接跳过（只有曾把 App 冻死的才会进黑名单）
+    // ★ 黑名单内的插件直接跳过
     if (getBlacklist().includes(url)) {
         return { success: false, message: "该插件曾导致应用卡死，已自动拉黑跳过", pluginUrl: url };
     }
@@ -246,6 +309,28 @@ async function installOnePluginByUrl(
         if (shouldCancel?.()) {
             FileSystem.deleteAsync(downloadRes.uri, { idempotent: true }).catch(() => { });
             return { success: false, message: "已取消", pluginUrl: url };
+        }
+
+        // ★★★ 核心防线：后台线程预检，死循环在独立线程被超时发现，
+        // 主线程 UI 全程不卡，不再需要强杀 App ★★★
+        onProgressText?.(`正在预检插件代码${pStr}…`);
+        await new Promise(resolve => setTimeout(resolve, 50));
+        let code = "";
+        try {
+            code = await FileSystem.readAsStringAsync(downloadRes.uri, { encoding: FileSystem.EncodingType.UTF8 });
+        } catch { /* 读不到就交给正常安装流程报错 */ }
+        if (code) {
+            const precheck = await precheckPluginCode(code);
+            if (!precheck.safe) {
+                addToBlacklist(url);
+                FileSystem.deleteAsync(downloadRes.uri, { idempotent: true }).catch(() => { });
+                trace("预检判定死循环，拉黑", url);
+                return {
+                    success: false,
+                    message: precheck.message ?? "插件代码疑似死循环，已跳过并拉黑",
+                    pluginUrl: url,
+                };
+            }
         }
 
         onProgressText?.(`正在解析插件代码${pStr}，设备可能短暂卡顿…`);
@@ -389,7 +474,7 @@ export default function PluginList() {
         let consecutiveFails = 0;
 
         try {
-            // ★ 关键一步：上次若有插件在解析中冻死/被杀，这里自动拉黑并提示
+            // ★ 上次若有插件在解析中冻死/被杀，这里自动拉黑并提示
             const poisoned = syncBlacklistFromLastInstall();
             if (poisoned) {
                 Toast.warn(`上次安装异常退出的插件已自动跳过（拉黑）:\n${poisoned.slice(0, 80)}`);
