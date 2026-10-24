@@ -30,14 +30,15 @@ interface IOption {
 
 // ============================================================
 // 最终定稿：可中断原生下载 + 自动重试 + 安装看门狗 + 全局熔断
+//           + 安装前登记 + 自动拉黑（防冻死插件循环卡住）
 // ============================================================
 
-const DOWNLOAD_TIMEOUT = 12000; 
-const INSTALL_TIMEOUT = 10000;  
-const MAX_RETRY = 3;            
+const DOWNLOAD_TIMEOUT = 12000;
+const INSTALL_TIMEOUT = 10000;
+const MAX_RETRY = 3;
 // 【极其重要】针对重度混淆代码，必须降为 1！否则并发解析会导致低配设备直接闪退
-const BATCH_SIZE = 1;           
-const MAX_CONSECUTIVE_FAILS = 5; 
+const BATCH_SIZE = 1;
+const MAX_CONSECUTIVE_FAILS = 5;
 
 const BROWSER_HEADERS = {
     "User-Agent":
@@ -48,6 +49,64 @@ const BROWSER_HEADERS = {
     "Pragma": "no-cache",
     "Expires": "0",
 };
+
+// ------------------------------------------------------------
+// 自动拉黑：安装前登记 → 若 App 在解析中被杀，下次启动批量安装时
+// 自动把该 URL 写入黑名单并跳过，只拉黑真正冻死的，其余照常安装
+// ------------------------------------------------------------
+const LAST_INSTALLING_KEY = "plugin.lastInstalling";
+const BLACKLIST_KEY = "plugin.blacklist";
+
+function getBlacklist(): string[] {
+    try {
+        const raw: any = Config.getConfig(BLACKLIST_KEY as any);
+        if (Array.isArray(raw)) return raw;
+        if (typeof raw === "string") {
+            const arr = JSON.parse(raw);
+            if (Array.isArray(arr)) return arr;
+        }
+    } catch { /* ignore */ }
+    return [];
+}
+
+function addToBlacklist(url: string) {
+    try {
+        const list = getBlacklist();
+        if (!list.includes(url)) {
+            list.push(url);
+            Config.setConfig(BLACKLIST_KEY as any, list as any);
+        }
+    } catch (e: any) {
+        trace("写入黑名单失败", e?.message);
+    }
+}
+
+function setLastInstalling(url: string) {
+    try { Config.setConfig(LAST_INSTALLING_KEY as any, url as any); } catch { /* ignore */ }
+}
+
+function clearLastInstalling() {
+    try { Config.setConfig(LAST_INSTALLING_KEY as any, "" as any); } catch { /* ignore */ }
+}
+
+function getLastInstalling(): string {
+    try {
+        const v: any = Config.getConfig(LAST_INSTALLING_KEY as any);
+        return typeof v === "string" ? v : "";
+    } catch { return ""; }
+}
+
+// 批量安装/更新订阅前调用：若发现上次有"登记了但没装完"的插件，拉黑之
+function syncBlacklistFromLastInstall(): string | null {
+    const last = getLastInstalling();
+    if (last) {
+        addToBlacklist(last);
+        clearLastInstalling();
+        trace("检测到上次安装异常退出的插件，已自动拉黑", last);
+        return last;
+    }
+    return null;
+}
 
 function isRetryableError(msg: string): boolean {
     const m = (msg || "").toLowerCase();
@@ -72,7 +131,7 @@ async function downloadPluginFile(url: string): Promise<{ url: string; uri?: str
         let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
         const timeoutPromise = new Promise<never>((_, reject) => {
             timeoutTimer = setTimeout(() => {
-                downloadResumable?.cancelAsync().catch(() => {});
+                downloadResumable?.cancelAsync().catch(() => { });
                 reject(new Error("下载超时"));
             }, DOWNLOAD_TIMEOUT);
         });
@@ -114,6 +173,9 @@ async function installPluginFromLocalUri(url: string, uri: string): Promise<IIns
         if (typeof code !== "string" || code.trim().length === 0) throw new Error("内容为空");
         if (code.trim().startsWith("<")) throw new Error("返回 HTML 而非 JS");
 
+        // ★ 安装前登记：从这一刻起若 App 被杀/冻死重启，该 URL 会被自动拉黑
+        setLastInstalling(url);
+
         let installPromise: Promise<IInstallPluginResult>;
         if (typeof pm.installPluginFromScript === "function") {
             installPromise = (async () => {
@@ -131,9 +193,11 @@ async function installPluginFromLocalUri(url: string, uri: string): Promise<IIns
     } catch (e: any) {
         return { success: false, message: e?.message ?? String(e), pluginUrl: url };
     } finally {
+        // 正常返回（成功/失败/超时）都清除登记；只有"冻死被杀"才会留下登记
+        clearLastInstalling();
         if (watchdogTimer) clearTimeout(watchdogTimer);
         setTimeout(() => {
-            FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
+            FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => { });
         }, watchdogWon ? 30000 : 5000);
     }
 }
@@ -152,6 +216,11 @@ async function installOnePluginByUrl(
         }
     } catch { /* ignore */ }
 
+    // ★ 黑名单内的插件直接跳过（只有曾把 App 冻死的才会进黑名单）
+    if (getBlacklist().includes(url)) {
+        return { success: false, message: "该插件曾导致应用卡死，已自动拉黑跳过", pluginUrl: url };
+    }
+
     const pStr = currentIndex && totalCount ? ` · 第 ${currentIndex}/${totalCount} 个` : "";
     let last: IInstallPluginResult | null = null;
 
@@ -165,9 +234,9 @@ async function installOnePluginByUrl(
 
         onProgressText?.(`正在下载${pStr}…`);
         // 留出时间给 UI 渲染文字
-        await new Promise(resolve => setTimeout(resolve, 50)); 
+        await new Promise(resolve => setTimeout(resolve, 50));
         const downloadRes = await downloadPluginFile(url);
-        
+
         if (!downloadRes.uri) {
             last = { success: false, message: downloadRes.message || "下载失败", pluginUrl: url };
             if (!isRetryableError(last.message)) break;
@@ -175,13 +244,12 @@ async function installOnePluginByUrl(
         }
 
         if (shouldCancel?.()) {
-            FileSystem.deleteAsync(downloadRes.uri, { idempotent: true }).catch(() => {});
+            FileSystem.deleteAsync(downloadRes.uri, { idempotent: true }).catch(() => { });
             return { success: false, message: "已取消", pluginUrl: url };
         }
 
-        // 【重点提示】给用户打个预防针，马上要卡主线程解析混淆代码了
-        onProgressText?.(`正在解析插件代码${pStr}，设备可能暂短卡顿…`);
-        await new Promise(resolve => setTimeout(resolve, 100)); 
+        onProgressText?.(`正在解析插件代码${pStr}，设备可能短暂卡顿…`);
+        await new Promise(resolve => setTimeout(resolve, 100));
 
         last = await installPluginFromLocalUri(url, downloadRes.uri);
         if (last.success) return last;
@@ -221,6 +289,10 @@ async function uninstallPluginBySrcUrl(srcUrl: string): Promise<boolean> {
 }
 async function installPluginFromUrl(text: string, onProgressText?: (txt: string) => void, shouldCancel?: () => boolean): Promise<IInstallPluginResult[]> {
     try {
+        // ★ 单个网络安装也先同步黑名单
+        const poisoned = syncBlacklistFromLastInstall();
+        if (poisoned) onProgressText?.(`检测到上次安装异常退出的插件，已自动拉黑`);
+
         let urls: string[] = [];
         const inputUrl = text.trim();
         if (text.endsWith(".json")) {
@@ -273,7 +345,7 @@ export default function PluginList() {
         { icon: "bars-3", title: t("pluginSetting.menu.sort"), onPress() { navigator.navigate("/pluginsetting/sort"); } },
         {
             icon: "trash-outline", title: t("pluginSetting.menu.uninstallAll"),
-            onPress() { showDialog("SimpleDialog", { title: t("pluginSetting.menu.uninstallAll"), content: t("pluginSetting.menu.uninstallAllContent"), async onOk() { setLoading(true); await PluginManager.uninstallAllPlugins(); setLoading(false); } }); },
+            onPress() { showDialog("SimpleDialog", { title: t("pluginSetting.menu.uninstallAll"), content: t("pluginSetting.menu.uninstallAllContent"), async onOk() { setLoading(true); await PluginManager.uninstallAllPlugins(); setLoading(false); } }); } ,
         },
     ];
 
@@ -310,13 +382,19 @@ export default function PluginList() {
     async function onSubscribeClick() {
         const urls = Config.getConfig("plugin.subscribeUrl");
         if (!urls) { Toast.warn(t("toast.noSubscription")); return; }
-        
+
         setLoading(true); cancelRef.current = false;
         const allResults: IInstallPluginResult[] = [];
         let removedCount = 0;
-        let consecutiveFails = 0; 
+        let consecutiveFails = 0;
 
         try {
+            // ★ 关键一步：上次若有插件在解析中冻死/被杀，这里自动拉黑并提示
+            const poisoned = syncBlacklistFromLastInstall();
+            if (poisoned) {
+                Toast.warn(`上次安装异常退出的插件已自动跳过（拉黑）:\n${poisoned.slice(0, 80)}`);
+            }
+
             const urlItems = JSON.parse(urls!);
             if (!Array.isArray(urlItems)) throw new Error();
 
@@ -397,6 +475,9 @@ export default function PluginList() {
         setLoading(true); cancelRef.current = false;
         const allResults: IInstallPluginResult[] = [];
         try {
+            // ★ 更新全部前也同步黑名单
+            syncBlacklistFromLastInstall();
+
             for (let i = 0; i < plugins.length; ++i) {
                 if (cancelRef.current) break;
                 const srcUrl = plugins[i].instance.srcUrl;
