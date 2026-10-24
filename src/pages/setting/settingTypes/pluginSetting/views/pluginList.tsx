@@ -2,6 +2,7 @@ import React, { useRef, useState } from "react";
 import { FlatList, StyleSheet, Text, View } from "react-native";
 import rpx from "@/utils/rpx";
 import * as DocumentPicker from "expo-document-picker";
+import * as FileSystem from "expo-file-system";
 import Loading from "@/components/base/loading";
 
 import PluginManager, { useSortedPlugins } from "@/core/pluginManager";
@@ -64,33 +65,63 @@ function AddMoreFooter({ onPress }: { onPress: () => void }) {
 
 const DOWNLOAD_TIMEOUT = 15000;
 const MAX_RETRY = 3; // 每个插件最多尝试 3 次（首次 + 2 次重试）
+const BATCH_SIZE = 3; // 两条安装路径都不进内部安装队列，并发 3 安全
+
+// 统一的浏览器请求头，破解防盗链和 UA 拦截
+const BROWSER_HEADERS = {
+    "User-Agent":
+        "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Expires": "0",
+};
 
 /** 判断是否值得重试：404/403/内容无效属于源失效，重试也没用，直接放弃 */
 function isRetryableError(msg: string): boolean {
     const m = (msg || "").toLowerCase();
-    if (m.includes("404") || m.includes("403") || m.includes("无法解析") ||
-        m.includes("无法识别") || m.includes("内容为空") || m.includes("html")) {
+    if (
+        m.includes("404") ||
+        m.includes("403") ||
+        m.includes("无法解析") ||
+        m.includes("无法识别") ||
+        m.includes("内容为空") ||
+        m.includes("html")
+    ) {
         return false;
     }
     return true;
 }
 
 /**
- * 【纯网络安装版】下载（我们自己做，可取消）→ 安装（喂给 PluginManager）。
+ * 单插件下载 + 安装。
+ *
+ * 【架构说明】全程不调用 PluginManager.installPluginFromUrl：
+ * 那条路内部会走网络安装队列，一旦内部请求挂死会永久占锁，
+ * 后续所有安装全部排队等待（最初"卡在 4/57"的病根）。
+ *
+ * 下载：axios + AbortController，超时能真正中断请求（带浏览器头防拦截）；
+ * 安装：优先 installPluginFromScript（从代码直装），
+ *      否则写临时文件走 installPluginFromLocalFile（本地安装路径，无网络依赖）。
  */
-let lockPoisoned = false; // 连续超时 => 内部安装锁可能被占死
-
 async function downloadAndInstallPlugin(
     url: string,
 ): Promise<IInstallPluginResult> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT);
+    let tmpUri: string | null = null;
+
     try {
         const response = await axios.get(url, {
             timeout: DOWNLOAD_TIMEOUT,
             signal: controller.signal,
             responseType: "text",
             transformResponse: [data => data],
+            headers: {
+                ...BROWSER_HEADERS,
+                "Referer": url,
+            },
         });
 
         const code = response.data;
@@ -109,16 +140,15 @@ async function downloadAndInstallPlugin(
             };
         }
 
-        // ========== 安装阶段 ==========
         const pm: any = PluginManager as any;
+        const notCheckVersion = Config.getConfig("basic.notCheckPluginVersion");
 
-        // 路径 A（首选）：installPluginFromScript —— 从代码字符串直接安装，无网络队列
+        // 路径 A（首选）：installPluginFromScript —— 从代码字符串直接安装
         if (typeof pm.installPluginFromScript === "function") {
             const r = await pm.installPluginFromScript(code, {
-                notCheckVersion: Config.getConfig("basic.notCheckPluginVersion"),
+                notCheckVersion,
             });
-            if (r?.success ?? true) {
-                lockPoisoned = false;
+            if (r === undefined || r?.success) {
                 return { success: true, message: "", pluginUrl: url };
             }
             return {
@@ -128,43 +158,42 @@ async function downloadAndInstallPlugin(
             };
         }
 
-        // 路径 B（兜底）：installPluginFromUrl + 硬超时竞速
-        let installTimer: ReturnType<typeof setTimeout> | null = null;
-        try {
-            const timeoutResult = new Promise<IInstallPluginResult>(resolve => {
-                installTimer = setTimeout(() => {
-                    lockPoisoned = true; 
-                    resolve({
-                        success: false,
-                        message: "安装内部超时（可能需要重启应用后重试）",
-                        pluginUrl: url,
-                    });
-                }, DOWNLOAD_TIMEOUT);
-            });
+        // 路径 B（兜底）：写临时文件 → 本地安装（与"从本地安装插件"同路径）
+        const safeName =
+            "plugin_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ".js";
+        tmpUri = (FileSystem.cacheDirectory ?? "") + safeName;
+        await FileSystem.writeAsStringAsync(tmpUri, code, {
+            encoding: FileSystem.EncodingType.UTF8,
+        });
 
-            const r = await Promise.race([
-                pm.installPluginFromUrl(url, {
-                    notCheckVersion: Config.getConfig("basic.notCheckPluginVersion"),
-                }),
-                timeoutResult,
-            ]);
-            if (r?.success ?? false) {
-                lockPoisoned = false;
+        try {
+            const r = await pm.installPluginFromLocalFile(tmpUri, {
+                notCheckVersion,
+                useExpoFs: true,
+            });
+            // undefined 视为成功，兼容返回 void 的版本
+            if (r === undefined || r?.success) {
+                return { success: true, message: "", pluginUrl: url };
             }
-            return r ?? {
+            return {
                 success: false,
-                message: "安装无返回结果",
+                message: r?.message ?? "本地安装失败",
                 pluginUrl: url,
             };
         } finally {
-            if (installTimer) clearTimeout(installTimer);
+            FileSystem.deleteAsync(tmpUri, { idempotent: true }).catch(() => {});
         }
     } catch (e: any) {
         const aborted =
-            e?.code === "ECONNABORTED" || e?.name === "AbortError" || e?.message === "canceled";
+            e?.code === "ECONNABORTED" ||
+            e?.name === "AbortError" ||
+            e?.message === "canceled";
+        trace("下载失败", url, "code:", e?.code, "msg:", e?.message);
         return {
             success: false,
-            message: aborted ? `请求超时（${DOWNLOAD_TIMEOUT / 1000}秒）` : e?.message ?? String(e),
+            message: aborted
+                ? `请求超时（${DOWNLOAD_TIMEOUT / 1000}秒）`
+                : e?.message ?? String(e),
             pluginUrl: url,
         };
     } finally {
@@ -173,19 +202,26 @@ async function downloadAndInstallPlugin(
 }
 
 /**
- * 单插件安装：最多 MAX_RETRY 次尝试，指数退避
+ * 单插件安装入口：最多 MAX_RETRY 次尝试，指数退避（1s → 2s）。
+ * - 只有临时性错误（超时/断网）才重试，源失效直接放弃；
+ * - 已安装相同 srcUrl 的插件视为成功，直接跳过；
+ * - 重试文案带总进度。
  */
 async function installOnePluginByUrl(
     url: string,
     onProgressText?: (txt: string) => void,
     shouldCancel?: () => boolean,
+    currentIndex?: number,
+    totalCount?: number,
 ): Promise<IInstallPluginResult> {
     try {
         const installed = PluginManager.getSortedPlugins?.() ?? [];
         if (installed.some(p => p.instance?.srcUrl === url)) {
             return { success: true, message: "已安装，跳过", pluginUrl: url };
         }
-    } catch { /* API 不存在则忽略 */ }
+    } catch {
+        /* API 不存在则忽略 */
+    }
 
     let last: IInstallPluginResult | null = null;
 
@@ -193,14 +229,20 @@ async function installOnePluginByUrl(
         if (shouldCancel?.()) break;
 
         if (attempt > 1) {
-            onProgressText?.(`重试中 ${attempt - 1}/${MAX_RETRY - 1}…`);
-            await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt - 2)));
+            const progressStr =
+                currentIndex !== undefined && totalCount !== undefined
+                    ? ` · 第 ${currentIndex}/${totalCount} 个`
+                    : "";
+            onProgressText?.(`重试中 ${attempt - 1}/${MAX_RETRY - 1}${progressStr}…`);
+            await new Promise(resolve =>
+                setTimeout(resolve, 1000 * Math.pow(2, attempt - 2)),
+            );
         }
 
         last = await downloadAndInstallPlugin(url);
         if (last.success) return last;
 
-        if (!isRetryableError(last.message)) break; 
+        if (!isRetryableError(last.message)) break;
     }
 
     return {
@@ -210,7 +252,7 @@ async function installOnePluginByUrl(
 }
 
 /**
- * 从 URL（或订阅 JSON）安装一批插件。
+ * 从 URL（或订阅 JSON）安装一批插件：并发 3 + allSettled，单点失败不拖累他人。
  */
 async function installPluginFromUrl(
     text: string,
@@ -230,7 +272,7 @@ async function installPluginFromUrl(
                     await axios.get(inputUrl, {
                         timeout: 20000,
                         signal: controller.signal,
-                        headers: { "Cache-Control": "no-cache", Pragma: "no-cache", Expires: "0" },
+                        headers: BROWSER_HEADERS,
                     })
                 ).data;
                 urls = (jsonFile?.plugins ?? []).map((_: any) => _.url);
@@ -239,7 +281,11 @@ async function installPluginFromUrl(
             }
 
             if (urls.length === 0) {
-                return [{ success: false, message: "订阅 JSON 中没有插件（plugins 为空）", pluginUrl: inputUrl }];
+                return [{
+                    success: false,
+                    message: "订阅 JSON 中没有插件（plugins 为空）",
+                    pluginUrl: inputUrl,
+                }];
             }
         } else {
             urls = [inputUrl];
@@ -248,17 +294,23 @@ async function installPluginFromUrl(
         urls = Array.from(new Set(urls.filter(u => u && u.trim())));
 
         const results: IInstallPluginResult[] = [];
-        const BATCH_SIZE =
-            typeof (PluginManager as any).installPluginFromScript === "function" ? 3 : 1;
         let completed = 0;
         const total = urls.length;
 
         for (let i = 0; i < urls.length; i += BATCH_SIZE) {
-            if (shouldCancel?.() || lockPoisoned) break;
+            if (shouldCancel?.()) break;
             const batch = urls.slice(i, i + BATCH_SIZE);
 
             const batchResults = await Promise.allSettled(
-                batch.map(u => installOnePluginByUrl(u, onProgressText, shouldCancel)),
+                batch.map((u, index) =>
+                    installOnePluginByUrl(
+                        u,
+                        onProgressText,
+                        shouldCancel,
+                        completed + index + 1,
+                        total,
+                    ),
+                ),
             );
 
             for (let j = 0; j < batchResults.length; j++) {
@@ -292,10 +344,16 @@ function getSubscriptionState(): Record<string, string[]> {
         const raw: any = Config.getConfig("plugin.subscribeState" as any);
         if (!raw) return {};
         if (typeof raw === "string") {
-            try { return JSON.parse(raw); } catch { return {}; }
+            try {
+                return JSON.parse(raw);
+            } catch {
+                return {};
+            }
         }
         return raw;
-    } catch { return {}; }
+    } catch {
+        return {};
+    }
 }
 
 function setSubscriptionState(state: Record<string, string[]>) {
@@ -314,7 +372,7 @@ async function fetchSubscriptionPluginUrls(subUrl: string): Promise<string[]> {
             await axios.get(subUrl, {
                 timeout: 20000,
                 signal: controller.signal,
-                headers: { "Cache-Control": "no-cache", Pragma: "no-cache", Expires: "0" },
+                headers: BROWSER_HEADERS,
             })
         ).data;
         const urls: string[] = (jsonFile?.plugins ?? [])
@@ -356,12 +414,16 @@ export default function PluginList() {
         {
             icon: "bookmark-square",
             title: t("pluginSetting.menu.subscriptionSetting"),
-            async onPress() { navigator.navigate("/pluginsetting/subscribe"); },
+            async onPress() {
+                navigator.navigate("/pluginsetting/subscribe");
+            },
         },
         {
             icon: "bars-3",
             title: t("pluginSetting.menu.sort"),
-            onPress() { navigator.navigate("/pluginsetting/sort"); },
+            onPress() {
+                navigator.navigate("/pluginsetting/sort");
+            },
         },
         {
             icon: "trash-outline",
@@ -393,7 +455,9 @@ export default function PluginList() {
             await Promise.all(
                 results.assets.map(async it => {
                     await PluginManager.installPluginFromLocalFile(it.uri, {
-                        notCheckVersion: Config.getConfig("basic.notCheckPluginVersion"),
+                        notCheckVersion: Config.getConfig(
+                            "basic.notCheckPluginVersion",
+                        ),
                         useExpoFs: true,
                     });
                 }),
@@ -423,6 +487,7 @@ export default function PluginList() {
                     () => cancelRef.current,
                 );
                 showInstallSummary(result);
+
                 setProgressText("");
                 setLoading(false);
             },
@@ -437,7 +502,6 @@ export default function PluginList() {
         }
         setLoading(true);
         cancelRef.current = false;
-        lockPoisoned = false; // 重置状态
 
         const allResults: IInstallPluginResult[] = [];
         let removedCount = 0;
@@ -469,27 +533,27 @@ export default function PluginList() {
                 }
             }
 
-            // ========== 阶段 2：安装/更新（自适应并发，防锁竞争） ==========
+            // ========== 阶段 2：安装/更新 ==========
             const remoteList = Array.from(remoteUrlSet);
-            // 【最终修改】和 installPluginFromUrl 保持一致：路径 A 并发 3，路径 B 降为 1
-            const BATCH_SIZE =
-                typeof (PluginManager as any).installPluginFromScript === "function" ? 3 : 1;
             let completedCount = 0;
 
             for (let i = 0; i < remoteList.length; i += BATCH_SIZE) {
-                if (cancelRef.current || lockPoisoned) break;
-
+                if (cancelRef.current) break;
                 const batch = remoteList.slice(i, i + BATCH_SIZE);
 
                 setProgressText(`正在安装插件 ${completedCount}/${remoteList.length}`);
                 await new Promise(resolve => setTimeout(resolve, 30));
 
                 const batchResults = await Promise.allSettled(
-                    batch.map(url => installOnePluginByUrl(
-                        url,
-                        setProgressText,
-                        () => cancelRef.current,
-                    ))
+                    batch.map((url, index) =>
+                        installOnePluginByUrl(
+                            url,
+                            setProgressText,
+                            () => cancelRef.current,
+                            completedCount + index + 1,
+                            remoteList.length,
+                        ),
+                    ),
                 );
 
                 for (let j = 0; j < batchResults.length; j++) {
@@ -514,7 +578,9 @@ export default function PluginList() {
             for (const subUrl of Object.keys(previousState)) {
                 (previousState[subUrl] ?? []).forEach(u => previousAllUrls.add(u));
             }
-            const toRemove = Array.from(previousAllUrls).filter(u => !remoteUrlSet.has(u));
+            const toRemove = Array.from(previousAllUrls).filter(
+                u => !remoteUrlSet.has(u),
+            );
 
             for (let i = 0; i < toRemove.length; ++i) {
                 if (cancelRef.current) break;
@@ -534,11 +600,14 @@ export default function PluginList() {
             } else if (removedCount > 0) {
                 Toast.success(`已移除 ${removedCount} 个失效插件`);
             }
-
         } catch {
             if (urls?.length) {
                 setProgressText("正在安装插件...");
-                const result = await installPluginFromUrl(urls, setProgressText, () => cancelRef.current);
+                const result = await installPluginFromUrl(
+                    urls,
+                    setProgressText,
+                    () => cancelRef.current,
+                );
                 if (result.length > 0) {
                     showInstallSummary(result);
                 } else {
@@ -554,7 +623,6 @@ export default function PluginList() {
         const plugins = PluginManager.getEnabledPlugins();
         setLoading(true);
         cancelRef.current = false;
-        lockPoisoned = false;
 
         const allResults: IInstallPluginResult[] = [];
 
@@ -566,11 +634,20 @@ export default function PluginList() {
                     setProgressText(`正在更新插件 ${i + 1}/${plugins.length}`);
                     await new Promise(resolve => setTimeout(resolve, 30));
 
-                    const result = await installPluginFromUrl(srcUrl, setProgressText, () => cancelRef.current);
+                    const result = await installPluginFromUrl(
+                        srcUrl,
+                        setProgressText,
+                        () => cancelRef.current,
+                    );
                     allResults.push(...result);
                 }
             }
-            showInstallSummary(allResults, t("toast.updatePluginSuccess"), t("toast.partialPluginUpdateFailed"), t("toast.allPluginUpdateFailed"));
+            showInstallSummary(
+                allResults,
+                t("toast.updatePluginSuccess"),
+                t("toast.partialPluginUpdateFailed"),
+                t("toast.allPluginUpdateFailed"),
+            );
         } catch (e: any) {
             Toast.warn(t("toast.unknownError", { reason: e?.message ?? e }));
         }
@@ -589,8 +666,8 @@ export default function PluginList() {
             return;
         }
 
-        const successResults: IInstallPluginResult[] = [];
         const failResults: IInstallPluginResult[] = [];
+        let successCount = 0;
 
         const timeoutFailures: IInstallPluginResult[] = [];
         const invalidFailures: IInstallPluginResult[] = [];
@@ -598,15 +675,18 @@ export default function PluginList() {
 
         results.forEach(r => {
             if (r.success) {
-                successResults.push(r);
+                successCount++;
             } else {
                 failResults.push(r);
                 const msg = (r.message ?? "").toLowerCase();
                 if (msg.includes("超时") || msg.includes("timeout")) {
                     timeoutFailures.push(r);
                 } else if (
-                    msg.includes("404") || msg.includes("403") || msg.includes("不存在") ||
-                    msg.includes("无法解析") || msg.includes("无法识别")
+                    msg.includes("404") ||
+                    msg.includes("403") ||
+                    msg.includes("不存在") ||
+                    msg.includes("无法解析") ||
+                    msg.includes("无法识别")
                 ) {
                     invalidFailures.push(r);
                 } else {
@@ -616,7 +696,6 @@ export default function PluginList() {
         });
 
         const total = results.length;
-        const successCount = successResults.length;
         const failCount = failResults.length;
 
         if (failCount === 0) {
@@ -631,15 +710,10 @@ export default function PluginList() {
         if (otherFailures.length > 0) failParts.push(`其他 ${otherFailures.length}`);
         const summaryText = `${parts.join("，")}（${failParts.join(" · ")}）`;
 
-        if (lockPoisoned) {
-            Toast.warn("检测到安装队列疑似卡死，建议重启应用后重新执行安装", {
-                type: "warn",
-                duration: 5000,
-            });
-        }
-
         Toast.warn(
-            successCount > 0 ? (partialMsg ?? t("toast.partialPluginInstallFailed")) : (allFailMsg ?? t("toast.allPluginInstallFailed")),
+            successCount > 0
+                ? (partialMsg ?? t("toast.partialPluginInstallFailed"))
+                : (allFailMsg ?? t("toast.allPluginInstallFailed")),
             {
                 type: "warn",
                 duration: 4000,
@@ -647,7 +721,16 @@ export default function PluginList() {
                 onActionClick: () => {
                     showDialog("SimpleDialog", {
                         title: t("pluginSetting.menu.pluginInstallFailedDialogTitle"),
-                        content: failResults.map(it => (it.pluginUrl ?? "") + "\n" + t("pluginSetting.failReason", { reason: it.message ?? "" })).join("\n-----\n"),
+                        content: failResults
+                            .map(
+                                it =>
+                                    (it.pluginUrl ?? "") +
+                                    "\n" +
+                                    t("pluginSetting.failReason", {
+                                        reason: it.message ?? "",
+                                    }),
+                            )
+                            .join("\n-----\n"),
                     });
                 },
             },
@@ -658,16 +741,33 @@ export default function PluginList() {
         showPanel("SimpleSelect", {
             header: t("pluginSetting.menu.installPlugin"),
             candidates: [
-                { value: "从本地安装插件", title: t("pluginSetting.fabOptions.installFromLocal") },
-                { value: "从网络安装插件", title: t("pluginSetting.fabOptions.installFromNetwork") },
-                { value: "更新全部插件", title: t("pluginSetting.fabOptions.updateAllPlugins") },
-                { value: "更新订阅", title: t("pluginSetting.fabOptions.updateSubscription") },
+                {
+                    value: "从本地安装插件",
+                    title: t("pluginSetting.fabOptions.installFromLocal"),
+                },
+                {
+                    value: "从网络安装插件",
+                    title: t("pluginSetting.fabOptions.installFromNetwork"),
+                },
+                {
+                    value: "更新全部插件",
+                    title: t("pluginSetting.fabOptions.updateAllPlugins"),
+                },
+                {
+                    value: "更新订阅",
+                    title: t("pluginSetting.fabOptions.updateSubscription"),
+                },
             ],
             onPress(item) {
-                if (item.value === "从本地安装插件") onInstallFromLocalClick();
-                else if (item.value === "从网络安装插件") onInstallFromNetworkClick();
-                else if (item.value === "更新订阅") onSubscribeClick();
-                else if (item.value === "更新全部插件") onUpdateAllClick();
+                if (item.value === "从本地安装插件") {
+                    onInstallFromLocalClick();
+                } else if (item.value === "从网络安装插件") {
+                    onInstallFromNetworkClick();
+                } else if (item.value === "更新订阅") {
+                    onSubscribeClick();
+                } else if (item.value === "更新全部插件") {
+                    onUpdateAllClick();
+                }
             },
         });
     }
@@ -705,7 +805,9 @@ export default function PluginList() {
                         renderItem={({ item: plugin }) => (
                             <PluginItem key={plugin.hash} plugin={plugin} />
                         )}
-                        ListFooterComponent={<AddMoreFooter onPress={openInstallMenu} />}
+                        ListFooterComponent={
+                            <AddMoreFooter onPress={openInstallMenu} />
+                        }
                     />
                 )}
             </HorizontalSafeAreaView>
@@ -714,8 +816,16 @@ export default function PluginList() {
 }
 
 const style = StyleSheet.create({
-    wrapper: { width: "100%", flex: 1 },
-    loadingWrapper: { flex: 1, width: "100%", justifyContent: "center", alignItems: "center" },
+    wrapper: {
+        width: "100%",
+        flex: 1,
+    },
+    loadingWrapper: {
+        flex: 1,
+        width: "100%",
+        justifyContent: "center",
+        alignItems: "center",
+    },
     progressText: {
         marginTop: rpx(24),
         fontSize: rpx(32),
@@ -724,19 +834,57 @@ const style = StyleSheet.create({
         textAlign: "center",
         paddingHorizontal: rpx(40),
     },
-    emptyWrapper: { flex: 1, justifyContent: "center", alignItems: "center", paddingVertical: rpx(100) },
+    emptyWrapper: {
+        flex: 1,
+        justifyContent: "center",
+        alignItems: "center",
+        paddingVertical: rpx(100),
+    },
     emptyButton: {
-        width: rpx(180), height: rpx(180), borderRadius: rpx(90), borderWidth: rpx(4),
-        borderColor: "rgba(255, 255, 255, 0.4)", justifyContent: "center", alignItems: "center", marginBottom: rpx(40),
+        width: rpx(180),
+        height: rpx(180),
+        borderRadius: rpx(90),
+        borderWidth: rpx(4),
+        borderColor: "rgba(255, 255, 255, 0.4)",
+        justifyContent: "center",
+        alignItems: "center",
+        marginBottom: rpx(40),
     },
-    emptyButtonPlus: { fontSize: rpx(100), lineHeight: rpx(110), textAlign: "center" },
-    emptyTitle: { fontSize: rpx(36), opacity: 0.95, marginBottom: rpx(16) },
-    emptySubTitle: { fontSize: rpx(28), opacity: 0.7, marginBottom: rpx(24) },
-    emptyHint: { fontSize: rpx(22), opacity: 0.45, paddingHorizontal: rpx(40), textAlign: "center" },
+    emptyButtonPlus: {
+        fontSize: rpx(100),
+        lineHeight: rpx(110),
+        textAlign: "center",
+    },
+    emptyTitle: {
+        fontSize: rpx(36),
+        opacity: 0.95,
+        marginBottom: rpx(16),
+    },
+    emptySubTitle: {
+        fontSize: rpx(28),
+        opacity: 0.7,
+        marginBottom: rpx(24),
+    },
+    emptyHint: {
+        fontSize: rpx(22),
+        opacity: 0.45,
+        paddingHorizontal: rpx(40),
+        textAlign: "center",
+    },
     addMoreButton: {
-        marginTop: rpx(24), marginBottom: rpx(60), marginHorizontal: rpx(20), paddingVertical: rpx(36),
-        borderRadius: rpx(16), borderWidth: rpx(2), borderStyle: "dashed", borderColor: "rgba(255, 255, 255, 0.2)",
-        justifyContent: "center", alignItems: "center",
+        marginTop: rpx(24),
+        marginBottom: rpx(60),
+        marginHorizontal: rpx(20),
+        paddingVertical: rpx(36),
+        borderRadius: rpx(16),
+        borderWidth: rpx(2),
+        borderStyle: "dashed",
+        borderColor: "rgba(255, 255, 255, 0.2)",
+        justifyContent: "center",
+        alignItems: "center",
     },
-    addMoreText: { fontSize: rpx(28), opacity: 0.55 },
+    addMoreText: {
+        fontSize: rpx(28),
+        opacity: 0.55,
+    },
 });
