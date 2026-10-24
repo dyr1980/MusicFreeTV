@@ -8,12 +8,18 @@ buildscript {
         kotlinVersion = "1.9.24"
     }
     repositories {
-        maven { url 'https://maven.aliyun.com/repository/central'}
-        maven { url 'https://maven.aliyun.com/repository/public' }
-        maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+        // 1. 官方源和常用源放在最前面，确保 GitHub Actions 稳定拉取
         google()
         mavenCentral()
         maven { url 'https://jitpack.io' }
+
+        // 2. 阿里云镜像作为本地加速备用。
+        // 通过判断 CI 环境变量，如果是 GitHub Actions 就不使用阿里云（避免 502 报错）
+        if (System.getenv("CI") == null) {
+            maven { url 'https://maven.aliyun.com/repository/central'}
+            maven { url 'https://maven.aliyun.com/repository/public' }
+            maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+        }
     }
     dependencies {
         classpath("com.android.tools.build:gradle")
