@@ -50,10 +50,10 @@ function AddMoreFooter({ onPress }: { onPress: () => void }) {
     );
 }
 
-// ==================== 核心修复：完美平衡成功率与防死锁 ====================
+// ==================== 核心修复：原生下载器，彻底根除底层死锁 ====================
 
-const DOWNLOAD_TIMEOUT = 12000; // 【采纳】12 秒，给慢源充足的下载时间
-const MAX_RETRY = 3;            // 【采纳】恢复 3 次尝试，成功率拉满
+const DOWNLOAD_TIMEOUT = 12000; // 12 秒，给慢源充足的下载时间
+const MAX_RETRY = 3;            // 恢复 3 次尝试，成功率拉满
 const BATCH_SIZE = 3; 
 
 const BROWSER_HEADERS = {
@@ -78,23 +78,27 @@ function isRetryableError(msg: string): boolean {
 }
 
 async function downloadAndInstallPlugin(url: string): Promise<IInstallPluginResult> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT);
     let tmpUri: string | null = null;
 
     try {
-        const response = await axios.get(url, {
-            timeout: DOWNLOAD_TIMEOUT,
-            signal: controller.signal,
-            responseType: "text",
-            transformResponse: [data => data],
+        const safeName = "plugin_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ".js";
+        tmpUri = (FileSystem.cacheDirectory ?? "") + safeName;
+
+        // 【终极杀招】使用原生下载器，底层等同于系统浏览器，绝不会像 axios 那样死锁
+        const downloadRes = await FileSystem.downloadAsync(url, tmpUri, {
             headers: {
                 ...BROWSER_HEADERS,
                 "Referer": url,
             },
         });
 
-        const code = response.data;
+        if (downloadRes.status !== 200) {
+            return { success: false, message: `HTTP 状态码 ${downloadRes.status}`, pluginUrl: url };
+        }
+
+        // 读取下载下来的文件，检查内容是否合法
+        const code = await FileSystem.readAsStringAsync(tmpUri, { encoding: FileSystem.EncodingType.UTF8 });
+
         if (typeof code !== "string" || code.trim().length === 0) {
             return { success: false, message: "下载内容为空（源已失效）", pluginUrl: url };
         }
@@ -114,11 +118,7 @@ async function downloadAndInstallPlugin(url: string): Promise<IInstallPluginResu
             return { success: false, message: r?.message ?? "插件校验失败", pluginUrl: url };
         }
 
-        // 路径 B：写临时文件 → 本地安装（彻底避开网络队列）
-        const safeName = "plugin_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ".js";
-        tmpUri = (FileSystem.cacheDirectory ?? "") + safeName;
-        await FileSystem.writeAsStringAsync(tmpUri, code, { encoding: FileSystem.EncodingType.UTF8 });
-
+        // 路径 B：既然文件已经下载到本地了，直接走本地安装（彻底避开网络队列）
         try {
             const r = await pm.installPluginFromLocalFile(tmpUri, { notCheckVersion, useExpoFs: true });
             if (r === undefined || r?.success) {
@@ -126,18 +126,16 @@ async function downloadAndInstallPlugin(url: string): Promise<IInstallPluginResu
             }
             return { success: false, message: r?.message ?? "本地安装失败", pluginUrl: url };
         } finally {
+            // 安装完清理临时文件
             FileSystem.deleteAsync(tmpUri, { idempotent: true }).catch(() => {});
         }
     } catch (e: any) {
-        const aborted = e?.code === "ECONNABORTED" || e?.name === "AbortError" || e?.message === "canceled";
-        trace("下载失败", url, "code:", e?.code, "msg:", e?.message);
+        trace("原生下载失败", url, "msg:", e?.message);
         return {
             success: false,
-            message: aborted ? `请求超时（${DOWNLOAD_TIMEOUT / 1000}秒）` : e?.message ?? String(e),
+            message: e?.message ?? String(e),
             pluginUrl: url,
         };
-    } finally {
-        clearTimeout(timer);
     }
 }
 
@@ -166,7 +164,7 @@ async function installOnePluginByUrl(
             await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt - 2)));
         }
 
-        // 【采纳】修复定时器泄漏：外层保险丝设得比下载超时稍长，并正确清理
+        // 外层保险丝：原生下载器不受 AbortController 控制，必须靠 Promise.race 强切
         let absTimer: ReturnType<typeof setTimeout> | null = null;
         const absoluteTimeout = new Promise<IInstallPluginResult>(resolve => {
             absTimer = setTimeout(() => {
@@ -487,6 +485,23 @@ export default function PluginList() {
                 showDialog("SimpleDialog", {
                     title: t("pluginSetting.menu.pluginInstallFailedDialogTitle"),
                     content: failResults.map(it => (it.pluginUrl ?? "") + "\n" + t("pluginSetting.failReason", { reason: it.message ?? "" })).join("\n-----\n"),
+                    okText: "重试失败插件",
+                    cancelText: "放弃",
+                    async onOk() {
+                        setLoading(true);
+                        setProgressText("正在重试失败插件...");
+                        const retryResults: IInstallPluginResult[] = [];
+                        
+                        for (let i = 0; i < failResults.length; i++) {
+                            setProgressText(`重试中 (${i + 1}/${failResults.length}) · 请稍候...`);
+                            const r = await installOnePluginByUrl(failResults[i].pluginUrl, undefined, undefined, undefined, undefined);
+                            retryResults.push(r);
+                        }
+
+                        setLoading(false);
+                        setProgressText("");
+                        showInstallSummary(retryResults, successMsg, partialMsg, allFailMsg);
+                    }
                 });
             },
         });
