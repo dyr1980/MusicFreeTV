@@ -180,10 +180,14 @@ export default function PluginList() {
             const newState: Record<string, string[]> = {};
             const remoteUrlSet = new Set<string>();
 
+            // ========== 阶段 1：获取订阅 ==========
             for (let i = 0; i < urlItems.length; ++i) {
                 if (cancelRef.current) break;
                 const subUrl = urlItems[i].url;
                 setProgressText(`正在获取订阅 ${i + 1}/${urlItems.length}`);
+                
+                // 【修改点】加入极短延时，强制让 UI 先渲染出上面的文字，防止假死
+                await new Promise(resolve => setTimeout(resolve, 50));
 
                 try {
                     const remoteUrls = await fetchSubscriptionPluginUrls(subUrl);
@@ -197,14 +201,20 @@ export default function PluginList() {
                 }
             }
 
+            // ========== 阶段 2：安装 / 更新订阅里的所有插件 ==========
             const remoteList = Array.from(remoteUrlSet);
             for (let i = 0; i < remoteList.length; ++i) {
                 if (cancelRef.current) break;
                 setProgressText(`正在安装插件 ${i + 1}/${remoteList.length}`);
+                
+                // 【修改点】加入极短延时，确保进度文字能实时跳动更新
+                await new Promise(resolve => setTimeout(resolve, 50));
+
                 const r = await installOnePluginByUrl(remoteList[i]);
                 allResults.push(r);
             }
 
+            // ========== 阶段 3：删除失效插件 ==========
             const previousAllUrls = new Set<string>();
             for (const subUrl of Object.keys(previousState)) {
                 (previousState[subUrl] ?? []).forEach(u => previousAllUrls.add(u));
@@ -216,6 +226,10 @@ export default function PluginList() {
             for (let i = 0; i < toRemove.length; ++i) {
                 if (cancelRef.current) break;
                 setProgressText(`正在移除失效插件 ${i + 1}/${toRemove.length}`);
+                
+                // 【修改点】强制刷新 UI
+                await new Promise(resolve => setTimeout(resolve, 50));
+
                 const ok = await uninstallPluginBySrcUrl(toRemove[i]);
                 if (ok) removedCount++;
             }
@@ -233,6 +247,8 @@ export default function PluginList() {
         } catch {
             if (urls?.length) {
                 setProgressText("正在安装插件...");
+                await new Promise(resolve => setTimeout(resolve, 50)); // 【修改点】刷新 UI
+
                 const result = await installPluginFromUrl(
                     urls,
                     setProgressText,
@@ -262,6 +278,8 @@ export default function PluginList() {
                 const srcUrl = plugins[i].instance.srcUrl;
                 if (srcUrl) {
                     setProgressText(`正在更新插件 ${i + 1}/${plugins.length}`);
+                    await new Promise(resolve => setTimeout(resolve, 50)); // 【修改点】刷新 UI
+                    
                     const result = await installPluginFromUrl(
                         srcUrl,
                         setProgressText,
@@ -458,11 +476,14 @@ const style = StyleSheet.create({
         justifyContent: "center",
         alignItems: "center",
     },
+    // 【修改点】强化了进度文字的样式
     progressText: {
         marginTop: rpx(24),
-        fontSize: rpx(28),
-        opacity: 0.7,
+        fontSize: rpx(32),       // 字号加大
+        color: "#FFFFFF",        // 纯白色，不再暗沉
+        fontWeight: "bold",      // 加粗显示
         textAlign: "center",
+        paddingHorizontal: rpx(40),
     },
     emptyWrapper: {
         flex: 1,
@@ -532,6 +553,8 @@ async function installPluginFromUrl(
 
         if (text.endsWith(".json")) {
             onProgressText?.("正在获取订阅 JSON...");
+            await new Promise(resolve => setTimeout(resolve, 50)); // 【修改点】刷新 UI
+            
             const jsonFile = (
                 await axios.get(inputUrl, {
                     timeout: 20000,
@@ -631,6 +654,9 @@ async function installPluginFromUrl(
             }
 
             reportProgress(completed);
+            
+            // 【修改点】防止 UI 冻结
+            await new Promise(resolve => setTimeout(resolve, 50));
 
             if (i + BATCH_SIZE < urls.length) {
                 await new Promise(resolve => setTimeout(resolve, BATCH_DELAY));
