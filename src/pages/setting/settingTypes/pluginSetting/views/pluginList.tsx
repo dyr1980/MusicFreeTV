@@ -50,11 +50,11 @@ function AddMoreFooter({ onPress }: { onPress: () => void }) {
     );
 }
 
-// ==================== 核心修复：原生下载器，彻底根除底层死锁 ====================
+// ==================== 核武器：可中断原生下载 + 全局熔断 ====================
 
-const DOWNLOAD_TIMEOUT = 12000; // 12 秒，给慢源充足的下载时间
-const MAX_RETRY = 3;            // 恢复 3 次尝试，成功率拉满
-const BATCH_SIZE = 3; 
+const DOWNLOAD_TIMEOUT = 12000; 
+const MAX_RETRY = 2;            
+const BATCH_SIZE = 3; // 【终极提速】并发 3 个，原生强杀机制保障下绝对安全
 
 const BROWSER_HEADERS = {
     "User-Agent":
@@ -68,42 +68,55 @@ const BROWSER_HEADERS = {
 
 function isRetryableError(msg: string): boolean {
     const m = (msg || "").toLowerCase();
-    if (
-        m.includes("404") || m.includes("403") || m.includes("无法解析") ||
-        m.includes("无法识别") || m.includes("内容为空") || m.includes("html")
-    ) {
-        return false;
-    }
+    if (m.includes("404") || m.includes("403") || m.includes("无效")) return false;
     return true;
 }
 
 async function downloadAndInstallPlugin(url: string): Promise<IInstallPluginResult> {
     let tmpUri: string | null = null;
+    let downloadResumable: FileSystem.DownloadResumable | null = null;
 
     try {
         const safeName = "plugin_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + ".js";
         tmpUri = (FileSystem.cacheDirectory ?? "") + safeName;
 
-        // 【终极杀招】使用原生下载器，底层等同于系统浏览器，绝不会像 axios 那样死锁
-        const downloadRes = await FileSystem.downloadAsync(url, tmpUri, {
-            headers: {
-                ...BROWSER_HEADERS,
-                "Referer": url,
-            },
+        downloadResumable = FileSystem.createDownloadResumable(
+            url,
+            tmpUri,
+            { headers: { ...BROWSER_HEADERS, "Referer": url } }
+        );
+
+        let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+        const timeoutPromise = new Promise<never>((_, reject) => {
+            timeoutTimer = setTimeout(() => {
+                if (downloadResumable) {
+                    downloadResumable.cancelAsync().catch(() => {}); 
+                }
+                reject(new Error("超时，已强制切断连接"));
+            }, DOWNLOAD_TIMEOUT);
         });
 
-        if (downloadRes.status !== 200) {
-            return { success: false, message: `HTTP 状态码 ${downloadRes.status}`, pluginUrl: url };
+        let downloadRes: FileSystem.FileSystemDownloadResult | undefined;
+        try {
+            downloadRes = await Promise.race([
+                downloadResumable.downloadAsync(),
+                timeoutPromise
+            ]) as FileSystem.FileSystemDownloadResult;
+        } finally {
+            if (timeoutTimer) clearTimeout(timeoutTimer); // 清理定时器
         }
 
-        // 读取下载下来的文件，检查内容是否合法
+        if (!downloadRes || downloadRes.status !== 200) {
+            return { success: false, message: `HTTP ${downloadRes?.status || "未知"}`, pluginUrl: url };
+        }
+
         const code = await FileSystem.readAsStringAsync(tmpUri, { encoding: FileSystem.EncodingType.UTF8 });
 
         if (typeof code !== "string" || code.trim().length === 0) {
-            return { success: false, message: "下载内容为空（源已失效）", pluginUrl: url };
+            return { success: false, message: "内容为空", pluginUrl: url };
         }
         if (code.trim().startsWith("<")) {
-            return { success: false, message: "返回 HTML 非 JS（源已失效）", pluginUrl: url };
+            return { success: false, message: "HTML 而非 JS", pluginUrl: url };
         }
 
         const pm: any = PluginManager as any;
@@ -112,30 +125,21 @@ async function downloadAndInstallPlugin(url: string): Promise<IInstallPluginResu
         // 路径 A：从代码字符串直接安装
         if (typeof pm.installPluginFromScript === "function") {
             const r = await pm.installPluginFromScript(code, { notCheckVersion });
-            if (r === undefined || r?.success) {
-                return { success: true, message: "", pluginUrl: url };
-            }
-            return { success: false, message: r?.message ?? "插件校验失败", pluginUrl: url };
+            if (r === undefined || r?.success) return { success: true, message: "", pluginUrl: url };
+            return { success: false, message: r?.message ?? "校验失败", pluginUrl: url };
         }
 
-        // 路径 B：既然文件已经下载到本地了，直接走本地安装（彻底避开网络队列）
+        // 路径 B：本地文件安装
         try {
             const r = await pm.installPluginFromLocalFile(tmpUri, { notCheckVersion, useExpoFs: true });
-            if (r === undefined || r?.success) {
-                return { success: true, message: "", pluginUrl: url };
-            }
-            return { success: false, message: r?.message ?? "本地安装失败", pluginUrl: url };
+            if (r === undefined || r?.success) return { success: true, message: "", pluginUrl: url };
+            return { success: false, message: r?.message ?? "安装失败", pluginUrl: url };
         } finally {
-            // 安装完清理临时文件
             FileSystem.deleteAsync(tmpUri, { idempotent: true }).catch(() => {});
         }
     } catch (e: any) {
-        trace("原生下载失败", url, "msg:", e?.message);
-        return {
-            success: false,
-            message: e?.message ?? String(e),
-            pluginUrl: url,
-        };
+        trace("下载被中断或失败", url, e?.message);
+        return { success: false, message: e?.message ?? String(e), pluginUrl: url };
     }
 }
 
@@ -149,7 +153,7 @@ async function installOnePluginByUrl(
     try {
         const installed = PluginManager.getSortedPlugins?.() ?? [];
         if (installed.some(p => p.instance?.srcUrl === url)) {
-            return { success: true, message: "已安装，跳过", pluginUrl: url };
+            return { success: true, message: "已安装", pluginUrl: url };
         }
     } catch { /* ignore */ }
 
@@ -159,38 +163,20 @@ async function installOnePluginByUrl(
         if (shouldCancel?.()) break;
 
         if (attempt > 1) {
-            const progressStr = currentIndex !== undefined && totalCount !== undefined ? ` · 第 ${currentIndex}/${totalCount} 个` : "";
-            onProgressText?.(`重试中 ${attempt - 1}/${MAX_RETRY - 1}${progressStr}…`);
-            await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt - 2)));
+            const pStr = currentIndex && totalCount ? ` · 第 ${currentIndex}/${totalCount} 个` : "";
+            onProgressText?.(`重试中 ${attempt - 1}/${MAX_RETRY - 1}${pStr}…`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
         }
 
-        // 外层保险丝：原生下载器不受 AbortController 控制，必须靠 Promise.race 强切
-        let absTimer: ReturnType<typeof setTimeout> | null = null;
-        const absoluteTimeout = new Promise<IInstallPluginResult>(resolve => {
-            absTimer = setTimeout(() => {
-                resolve({ success: false, message: "安装流程强制超时（跳过）", pluginUrl: url });
-            }, DOWNLOAD_TIMEOUT + 5000);
-        });
-
-        last = await Promise.race([
-            downloadAndInstallPlugin(url),
-            absoluteTimeout
-        ]);
-
-        if (absTimer) {
-            clearTimeout(absTimer);
-            absTimer = null;
-        }
-
+        last = await downloadAndInstallPlugin(url);
         if (last.success) return last;
         if (!isRetryableError(last.message)) break;
     }
 
-    return {
-        ...(last ?? { success: false, message: "未知错误", pluginUrl: url }),
-        pluginUrl: url,
-    };
+    return { ...(last ?? { success: false, message: "未知错误", pluginUrl: url }), pluginUrl: url };
 }
+
+// ==================== 订阅同步辅助 ====================
 
 async function installPluginFromUrl(
     text: string,
@@ -203,24 +189,13 @@ async function installPluginFromUrl(
 
         if (text.endsWith(".json")) {
             onProgressText?.("正在获取订阅 JSON...");
-            const controller = new AbortController();
-            const timer = setTimeout(() => controller.abort(), 15000);
-            try {
-                const jsonFile = (await axios.get(inputUrl, {
-                    timeout: 15000, signal: controller.signal, headers: BROWSER_HEADERS,
-                })).data;
-                urls = (jsonFile?.plugins ?? []).map((_: any) => _.url);
-            } finally {
-                clearTimeout(timer);
-            }
-
+            urls = await fetchSubscriptionPluginUrls(inputUrl);
             if (urls.length === 0) return [{ success: false, message: "订阅 JSON 中没有插件", pluginUrl: inputUrl }];
         } else {
             urls = [inputUrl];
         }
 
         urls = Array.from(new Set(urls.filter(u => u && u.trim())));
-
         const results: IInstallPluginResult[] = [];
         let completed = 0;
         const total = urls.length;
@@ -241,18 +216,14 @@ async function installPluginFromUrl(
                 else results.push({ success: false, message: "未知异常", pluginUrl: batch[j] });
                 completed++;
             }
-
             onProgressText?.(`正在安装插件 ${completed}/${total}`);
             await new Promise(resolve => setTimeout(resolve, 30));
         }
-
         return results;
     } catch (e: any) {
         return [{ success: false, message: e?.message, pluginUrl: text }];
     }
 }
-
-// ==================== 订阅同步辅助 ====================
 
 function getSubscriptionState(): Record<string, string[]> {
     try {
@@ -269,11 +240,10 @@ function setSubscriptionState(state: Record<string, string[]>) {
 
 async function fetchSubscriptionPluginUrls(subUrl: string): Promise<string[]> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
+    const timer = setTimeout(() => controller.abort(), 10000);
     try {
-        const jsonFile = (await axios.get(subUrl, { timeout: 15000, signal: controller.signal, headers: BROWSER_HEADERS })).data;
-        const urls: string[] = (jsonFile?.plugins ?? []).map((_: any) => _.url).filter((u: any) => u && String(u).trim());
-        return Array.from(new Set(urls));
+        const jsonFile = (await axios.get(subUrl, { timeout: 10000, signal: controller.signal, headers: BROWSER_HEADERS })).data;
+        return Array.from(new Set((jsonFile?.plugins ?? []).map((_: any) => _.url).filter((u: any) => u)));
     } finally { clearTimeout(timer); }
 }
 
@@ -315,7 +285,6 @@ export default function PluginList() {
             }));
             Toast.success(t("toast.installPluginSuccess"));
         } catch (e: any) {
-            trace("插件安装失败", e?.message);
             Toast.warn(t("toast.installPluginFail", { reason: e?.message ?? "" }));
         }
         setLoading(false);
@@ -342,6 +311,7 @@ export default function PluginList() {
         setLoading(true); cancelRef.current = false;
         const allResults: IInstallPluginResult[] = [];
         let removedCount = 0;
+        let consecutiveFails = 0; 
 
         try {
             const urlItems = JSON.parse(urls!);
@@ -363,7 +333,6 @@ export default function PluginList() {
                     const keep = previousState[urlItems[i].url] ?? [];
                     newState[urlItems[i].url] = keep;
                     keep.forEach(u => remoteUrlSet.add(u));
-                    trace("订阅拉取失败", urlItems[i].url, e?.message);
                 }
             }
 
@@ -372,8 +341,13 @@ export default function PluginList() {
 
             for (let i = 0; i < remoteList.length; i += BATCH_SIZE) {
                 if (cancelRef.current) break;
-                const batch = remoteList.slice(i, i + BATCH_SIZE);
+                
+                if (consecutiveFails >= 5) {
+                    Toast.warn("连续 5 个插件网络失败，已停止更新。请检查网络或使用本地安装。");
+                    break;
+                }
 
+                const batch = remoteList.slice(i, i + BATCH_SIZE);
                 setProgressText(`正在安装插件 ${completedCount}/${remoteList.length}`);
                 await new Promise(resolve => setTimeout(resolve, 30));
 
@@ -386,12 +360,16 @@ export default function PluginList() {
 
                 for (let j = 0; j < batchResults.length; j++) {
                     const res = batchResults[j];
-                    if (res.status === "fulfilled") allResults.push(res.value);
-                    else allResults.push({ success: false, message: "未知异常", pluginUrl: batch[j] });
+                    if (res.status === "fulfilled") {
+                        allResults.push(res.value);
+                        if (res.value.success) consecutiveFails = 0;
+                        else consecutiveFails++;
+                    } else {
+                        allResults.push({ success: false, message: "异常", pluginUrl: batch[j] });
+                        consecutiveFails++;
+                    }
                 }
-
                 completedCount += batch.length;
-                setProgressText(`正在安装插件 ${completedCount}/${remoteList.length}`);
             }
 
             const previousAllUrls = new Set<string>();
@@ -412,12 +390,7 @@ export default function PluginList() {
             else if (removedCount > 0) Toast.success(`已移除 ${removedCount} 个失效插件`);
 
         } catch {
-            if (urls?.length) {
-                setProgressText("正在安装插件...");
-                const result = await installPluginFromUrl(urls, setProgressText, () => cancelRef.current);
-                if (result.length > 0) showInstallSummary(result);
-                else Toast.warn(t("toast.subscriptionInvalid"));
-            }
+            // ignore
         }
         setProgressText(""); setLoading(false);
     }
@@ -426,16 +399,14 @@ export default function PluginList() {
         const plugins = PluginManager.getEnabledPlugins();
         setLoading(true); cancelRef.current = false;
         const allResults: IInstallPluginResult[] = [];
-
         try {
             for (let i = 0; i < plugins.length; ++i) {
-                if (cancelRef.current) break;
                 const srcUrl = plugins[i].instance.srcUrl;
                 if (srcUrl) {
                     setProgressText(`正在更新插件 ${i + 1}/${plugins.length}`);
                     await new Promise(resolve => setTimeout(resolve, 30));
-                    const result = await installPluginFromUrl(srcUrl, setProgressText, () => cancelRef.current);
-                    allResults.push(...result);
+                    const result = await installOnePluginByUrl(srcUrl, setProgressText, () => cancelRef.current);
+                    allResults.push(result);
                 }
             }
             showInstallSummary(allResults, t("toast.updatePluginSuccess"), t("toast.partialPluginUpdateFailed"), t("toast.allPluginUpdateFailed"));
@@ -447,64 +418,46 @@ export default function PluginList() {
 
     function showInstallSummary(results: IInstallPluginResult[], successMsg?: string, partialMsg?: string, allFailMsg?: string) {
         if (!results || results.length === 0) { Toast.warn(t("toast.subscriptionInvalid")); return; }
+        
+        const successResults = results.filter(r => r.success);
+        const failResults = results.filter(r => !r.success);
 
-        const successResults: IInstallPluginResult[] = [];
-        const failResults: IInstallPluginResult[] = [];
-        const timeoutFailures: IInstallPluginResult[] = [];
-        const invalidFailures: IInstallPluginResult[] = [];
-        const otherFailures: IInstallPluginResult[] = [];
+        if (failResults.length === 0) { 
+            Toast.success(successMsg ?? t("toast.installPluginSuccess")); 
+            return; 
+        }
 
-        results.forEach(r => {
-            if (r.success) successResults.push(r);
-            else {
-                failResults.push(r);
-                const msg = (r.message ?? "").toLowerCase();
-                if (msg.includes("超时") || msg.includes("timeout")) timeoutFailures.push(r);
-                else if (msg.includes("404") || msg.includes("403") || msg.includes("不存在") || msg.includes("无法解析") || msg.includes("无法识别")) invalidFailures.push(r);
-                else otherFailures.push(r);
-            }
-        });
+        const summaryText = `成功 ${successResults.length}/${results.length}（失败 ${failResults.length}）`;
 
-        const total = results.length;
-        const successCount = successResults.length;
-        const failCount = failResults.length;
-
-        if (failCount === 0) { Toast.success(successMsg ?? t("toast.installPluginSuccess")); return; }
-
-        const parts: string[] = [`成功 ${successCount}/${total}`];
-        const failParts: string[] = [`失败 ${failCount}`];
-        if (timeoutFailures.length > 0) failParts.push(`超时 ${timeoutFailures.length}`);
-        if (invalidFailures.length > 0) failParts.push(`源失效 ${invalidFailures.length}`);
-        if (otherFailures.length > 0) failParts.push(`其他 ${otherFailures.length}`);
-        const summaryText = `${parts.join("，")}（${failParts.join(" · ")}）`;
-
-        Toast.warn(successCount > 0 ? (partialMsg ?? t("toast.partialPluginInstallFailed")) : (allFailMsg ?? t("toast.allPluginInstallFailed")), {
-            type: "warn", duration: 4000,
-            actionText: `查看详情（${summaryText}）`,
-            onActionClick: () => {
-                showDialog("SimpleDialog", {
-                    title: t("pluginSetting.menu.pluginInstallFailedDialogTitle"),
-                    content: failResults.map(it => (it.pluginUrl ?? "") + "\n" + t("pluginSetting.failReason", { reason: it.message ?? "" })).join("\n-----\n"),
-                    okText: "重试失败插件",
-                    cancelText: "放弃",
-                    async onOk() {
-                        setLoading(true);
-                        setProgressText("正在重试失败插件...");
-                        const retryResults: IInstallPluginResult[] = [];
-                        
-                        for (let i = 0; i < failResults.length; i++) {
-                            setProgressText(`重试中 (${i + 1}/${failResults.length}) · 请稍候...`);
-                            const r = await installOnePluginByUrl(failResults[i].pluginUrl, undefined, undefined, undefined, undefined);
-                            retryResults.push(r);
+        Toast.warn(
+            successResults.length > 0
+                ? (partialMsg ?? t("toast.partialPluginInstallFailed"))
+                : (allFailMsg ?? t("toast.allPluginInstallFailed")),
+            {
+                type: "warn", 
+                duration: 4000,
+                actionText: `查看详情（${summaryText}）`,
+                onActionClick: () => {
+                    showDialog("SimpleDialog", {
+                        title: t("pluginSetting.menu.pluginInstallFailedDialogTitle"),
+                        content: failResults.map(it => (it.pluginUrl ?? "") + "\n" + t("pluginSetting.failReason", { reason: it.message ?? "" })).join("\n-----\n"),
+                        okText: "重试失败插件",
+                        cancelText: "放弃",
+                        async onOk() {
+                            setLoading(true); setProgressText("正在重试失败插件...");
+                            const retryResults: IInstallPluginResult[] = [];
+                            for (let i = 0; i < failResults.length; i++) {
+                                setProgressText(`重试中 (${i + 1}/${failResults.length})`);
+                                const r = await installOnePluginByUrl(failResults[i].pluginUrl);
+                                retryResults.push(r);
+                            }
+                            setLoading(false); setProgressText("");
+                            showInstallSummary(retryResults, successMsg, partialMsg, allFailMsg);
                         }
-
-                        setLoading(false);
-                        setProgressText("");
-                        showInstallSummary(retryResults, successMsg, partialMsg, allFailMsg);
-                    }
-                });
-            },
-        });
+                    });
+                },
+            }
+        );
     }
 
     function openInstallMenu() {
