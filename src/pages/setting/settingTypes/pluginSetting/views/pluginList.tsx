@@ -218,7 +218,7 @@ async function downloadPluginFile(url: string): Promise<{ url: string; uri?: str
     }
 }
 
-async function installPluginFromLocalUri(url: string, uri: string): Promise<IInstallPluginResult> {
+async function installPluginFromLocalUri(url: string, uri: string, onProgressText?: (txt: string) => void): Promise<IInstallPluginResult> {
     const pm: any = PluginManager as any;
     const notCheckVersion = Config.getConfig("basic.notCheckPluginVersion");
 
@@ -247,7 +247,12 @@ async function installPluginFromLocalUri(url: string, uri: string): Promise<IIns
             })();
         } else {
             installPromise = (async () => {
-                const r = await pm.installPluginFromLocalFile(uri, { notCheckVersion, useExpoFs: true });
+                const r = await pm.installPluginFromLocalFile(uri, {
+                    notCheckVersion,
+                    useExpoFs: true,
+                    // ★ 分步进度透传到屏幕
+                    onProgress: (step: string) => onProgressText?.(step),
+                } as any);
                 return { success: r === undefined || r?.success, message: r?.message ?? "", pluginUrl: url };
             })();
         }
@@ -333,10 +338,20 @@ async function installOnePluginByUrl(
             }
         }
 
-        onProgressText?.(`正在解析插件代码${pStr}，设备可能短暂卡顿…`);
-        await new Promise(resolve => setTimeout(resolve, 100));
+        // ★★★ 分步诊断：每一步都实时显示在屏幕上，秒级计时器用于判断
+        // JS 线程是否存活（数字在跳=活着；数字冻结=同步卡死）★★★
+        onProgressText?.(`读取中…${pStr}`);
+        let elapsed = 0;
+        const tickTimer = setInterval(() => {
+            elapsed++;
+            onProgressText?.(`解析中 ${elapsed}s${pStr}…`);
+        }, 1000);
 
-        last = await installPluginFromLocalUri(url, downloadRes.uri);
+        try {
+            last = await installPluginFromLocalUri(url, downloadRes.uri, onProgressText);
+        } finally {
+            clearInterval(tickTimer);
+        }
         if (last.success) return last;
         if (!isRetryableError(last.message)) break;
     }
