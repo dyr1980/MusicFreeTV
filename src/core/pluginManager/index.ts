@@ -184,17 +184,23 @@ class PluginManager implements IPluginManager, IInjectable {
         pluginPath: string,
         config?: IInstallPluginConfig & {
             useExpoFs?: boolean;
+            onProgress?: (step: string) => void;
         },
     ): Promise<IInstallPluginResult> {
+        const onProgress = config?.onProgress ?? (() => { });
         let funcCode: string;
+        onProgress("正在读取插件文件…");
         if (config?.useExpoFs) {
             funcCode = await readAsStringAsync(pluginPath);
         } else {
             funcCode = await readFile(pluginPath, "utf8");
         }
+        onProgress(`读取完成（${Math.round((funcCode?.length ?? 0) / 1024)}KB），开始解析…`);
 
         if (funcCode) {
+            const t0 = Date.now();
             const plugin = new Plugin(funcCode, pluginPath);
+            onProgress(`解析完成（耗时${Date.now() - t0}ms 状态:${plugin.state}）`);
             let allPlugins = [...this.getPlugins()];
 
             const _pluginIndex = allPlugins.findIndex(
